@@ -5,9 +5,7 @@ on:
     - cron: '23 3 * * *'
   workflow_dispatch:
 
-permissions:
-  contents: write
-  pull-requests: write
+permissions: {}
 
 concurrency:
   group: nodewarden-release-proposals
@@ -15,6 +13,9 @@ concurrency:
 
 jobs:
   propose:
+    permissions:
+      contents: write
+      pull-requests: write
     if: >-
       github.event.repository.default_branch == 'release-control' &&
       github.ref == 'refs/heads/release-control'
