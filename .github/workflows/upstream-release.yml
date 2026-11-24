@@ -1,0 +1,52 @@
+name: Update production from the latest NodeWarden release
+
+on:
+  schedule:
+    - cron: '23 3 * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: nodewarden-production-release
+  cancel-in-progress: false
+
+jobs:
+  update:
+    if: github.repository == 'fenghengzhi/nodewarden' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          ref: production
+          fetch-depth: 0
+
+      - name: Rebase the customization and publish production
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag=$(gh api repos/shuaiplus/nodewarden/releases/latest --jq 'select(.draft == false and .prerelease == false) | .tag_name')
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          git fetch --no-tags https://github.com/shuaiplus/nodewarden.git "refs/tags/$tag"
+          official=$(git rev-parse 'FETCH_HEAD^{commit}')
+          old=$(git rev-parse HEAD)
+          parent=$(git rev-parse HEAD^)
+          test "$(git show -s --format=%P HEAD)" = "$parent"
+
+          if git merge-base --is-ancestor "$official" "$parent"; then
+            echo "Production already includes $tag."
+            exit 0
+          fi
+          git merge-base --is-ancestor "$parent" "$official"
+          git config user.name 'NodeWarden Deployment'
+          git config user.email 'nodewarden-deploy@users.noreply.github.com'
+
+          git rebase --reapply-cherry-picks --empty=keep --onto "$official" "$parent"
+          test "$(git show -s --format=%P HEAD)" = "$official"
+          git push --atomic --force-with-lease="refs/heads/production:$old" origin \
+            HEAD:refs/heads/production "HEAD:refs/tags/nodewarden-deploy/$tag"
+          echo "Published $(git rev-parse HEAD) on $tag ($official)."
