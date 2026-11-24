@@ -1,6 +1,10 @@
 name = "nodewarden"
+account_id = "8db6a57d585fbc12e9d28f3399e03e64"
 main = "src/index.ts"
 compatibility_date = "2024-01-01"
+workers_dev = false
+preview_urls = false
+routes = [ { pattern = "vault.fenghengzhi.com", custom_domain = true } ]
 
 [build]
 command = "npm run build"
@@ -18,6 +22,7 @@ crons = [ "*/5 * * * *" ]
 [[d1_databases]]
 binding = "DB"
 database_name = "nodewarden-db"
+database_id = "c2e0534a-ea98-43c8-9be3-e1a2f8e8a7d9"
 
 [[durable_objects.bindings]]
 name = "NOTIFICATIONS_HUB"
