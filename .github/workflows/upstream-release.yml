@@ -1,0 +1,196 @@
+name: Propose NodeWarden release update
+
+on:
+  schedule:
+    - cron: '23 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: nodewarden-release-update
+  cancel-in-progress: false
+
+jobs:
+  propose-release:
+    if: >-
+      github.event.repository.default_branch == 'production' &&
+      github.ref == 'refs/heads/production'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Open a release pull request without running upstream code
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          BASE_BRANCH: ${{ github.event.repository.default_branch }}
+        shell: python
+        run: |
+          import base64
+          import json
+          import os
+          import re
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          UPSTREAM = 'shuaiplus/nodewarden'
+          repository = os.environ['REPOSITORY']
+          base = os.environ['BASE_BRANCH']
+          if base != 'production' or repository.lower() == UPSTREAM:
+              raise RuntimeError('Only a fork with production as its default branch is supported')
+          if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repository):
+              raise RuntimeError('Invalid fork repository name')
+          root = f'repos/{repository}'
+          public_root = f'repos/{UPSTREAM}'
+          semver = re.compile(r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)')
+          sha_pattern = re.compile(r'[0-9a-f]{40}')
+
+          class ApiError(RuntimeError):
+              def __init__(self, method, path, status):
+                  self.status = status
+                  super().__init__(f'GitHub API {method} {path} returned HTTP {status}')
+
+          def api(path, *, method='GET', data=None, authenticated=False, missing_ok=False):
+              headers = {
+                  'Accept': 'application/vnd.github+json',
+                  'X-GitHub-Api-Version': '2022-11-28',
+                  'User-Agent': 'nodewarden-fork-release-update',
+              }
+              if authenticated:
+                  if path != root and not path.startswith(root + '/'):
+                      raise RuntimeError('Authenticated API access outside this fork is forbidden')
+                  headers['Authorization'] = 'Bearer ' + os.environ['GH_TOKEN']
+              elif method != 'GET' or not path.startswith(public_root + '/'):
+                  raise RuntimeError('Upstream API access must be public and read-only')
+              body = None if data is None else json.dumps(data).encode()
+              if body is not None:
+                  headers['Content-Type'] = 'application/json'
+              request = urllib.request.Request(
+                  'https://api.github.com/' + path, data=body, headers=headers, method=method
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=45) as response:
+                      return json.load(response)
+              except urllib.error.HTTPError as error:
+                  status = error.code
+                  error.close()
+                  if missing_ok and status == 404:
+                      return None
+                  raise ApiError(method, path, status) from None
+
+          def own(path='', **kwargs):
+              return api(root + ('/' + path if path else ''), authenticated=True, **kwargs)
+
+          def version_tuple(version):
+              if not isinstance(version, str) or not semver.fullmatch(version):
+                  raise RuntimeError('Expected a stable MAJOR.MINOR.PATCH version')
+              return tuple(map(int, version.split('.')))
+
+          metadata = own()
+          if (not metadata.get('fork') or metadata.get('private')
+                  or metadata.get('source', {}).get('full_name', '').lower() != UPSTREAM
+                  or metadata.get('default_branch') != base):
+              raise RuntimeError('Expected a public NodeWarden fork whose default branch is production')
+          base_sha = own('git/ref/heads/' + base)['object']['sha']
+          package_file = own('contents/package.json?' + urllib.parse.urlencode({'ref': base_sha}))
+          if package_file.get('type') != 'file' or package_file.get('encoding') != 'base64':
+              raise RuntimeError('production/package.json must be an ordinary JSON file')
+          current_version = json.loads(base64.b64decode(package_file['content']))['version']
+          current_tuple = version_tuple(current_version)
+          release = api(public_root + '/releases/latest', missing_ok=True)
+          if release is None:
+              print('No published stable release exists.')
+              raise SystemExit(0)
+          tag = release.get('tag_name', '')
+          if release.get('draft') or release.get('prerelease') or not isinstance(tag, str):
+              raise RuntimeError('Latest release is not a stable published release')
+          if not tag.startswith('v'):
+              raise RuntimeError('Release tag must use vMAJOR.MINOR.PATCH')
+          version = tag[1:]
+          if version_tuple(version) <= current_tuple:
+              print('The installed version is at least this release; no pull request needed.')
+              raise SystemExit(0)
+
+          target = api(public_root + '/git/ref/tags/' + urllib.parse.quote(tag, safe=''))['object']
+          for _ in range(16):
+              if not sha_pattern.fullmatch(target.get('sha', '')):
+                  raise RuntimeError('Invalid release tag object')
+              if target['type'] == 'commit':
+                  break
+              if target['type'] != 'tag':
+                  raise RuntimeError('Release tag does not resolve to a commit')
+              target = api(public_root + '/git/tags/' + target['sha'])['object']
+          else:
+              raise RuntimeError('Too many nested annotated tags')
+          commit = target['sha']
+          comparison = own('compare/' + base_sha + '...' + commit)
+          if comparison.get('status') in ('behind', 'identical'):
+              print('This release commit is already included in production.')
+              raise SystemExit(0)
+          if (comparison.get('status') not in ('ahead', 'diverged')
+                  or not comparison.get('merge_base_commit', {}).get('sha')):
+              raise RuntimeError('No verified common history with the release; refusing to propose it')
+
+          branch = 'release-update/' + tag
+          pr_query = urllib.parse.urlencode({
+              'state': 'all', 'base': base,
+              'head': repository.split('/')[0] + ':' + branch, 'per_page': 100,
+          })
+          if own('pulls?' + pr_query):
+              print('A pull request for this release already exists; leaving it unchanged.')
+              raise SystemExit(0)
+          ref_path = 'git/ref/heads/' + branch
+          ref = own(ref_path, missing_ok=True)
+          if ref is None:
+              try:
+                  own('git/refs', method='POST', data={'ref': 'refs/heads/' + branch, 'sha': commit})
+              except ApiError as error:
+                  # Recover a concurrent creation or a committed operation whose response failed.
+                  ref = own(ref_path, missing_ok=True)
+                  if ref is None:
+                      message = (
+                          f'无法创建更新分支（HTTP {error.status}）。production 和 main 均未修改。\n\n'
+                          'GitHub 可能拒绝尚未在此 fork 可用的提交，或要求 GITHUB_TOKEN 不具备的 '
+                          'Workflows 写权限；分支规则也可能阻止创建。不会自动扩大权限或强推。\n\n'
+                          '检查 Actions 日志及仓库规则；如需手动准备分支，请在此 fork 的本地克隆中运行：\n\n'
+                          '```sh\n'
+                          f'git fetch https://github.com/{UPSTREAM}.git tag {tag}\n'
+                          f'git push origin {commit}:refs/heads/{branch}\n'
+                          '```\n\n'
+                          '上述命令只推送更新分支。随后重新运行此工作流，即可继续创建 PR。\n'
+                      )
+                      summary = os.environ.get('GITHUB_STEP_SUMMARY')
+                      if summary:
+                          with open(summary, 'a', encoding='utf-8') as output:
+                              output.write(message)
+                      print(message)
+                      raise RuntimeError('Release branch creation requires manual attention') from None
+              if ref is None:
+                  ref = own(ref_path)
+          if ref['object']['type'] != 'commit' or ref['object']['sha'] != commit:
+              raise RuntimeError('Existing release branch differs from the official tag; not overwriting it')
+          if own('git/ref/heads/' + base)['object']['sha'] != base_sha:
+              raise RuntimeError('production changed during this run; retry to reassess the release')
+
+          release_url = f'https://github.com/{UPSTREAM}/releases/tag/{tag}'
+          compare_url = f'https://github.com/{repository}/compare/{base}...{branch}'
+          body = (
+              f'将 NodeWarden 从 {current_version} 更新至正式版 {version}。\n\n'
+              f'- [官方发布说明]({release_url})\n'
+              f'- [上游更新与当前生产分支的差异]({compare_url})\n'
+              f'- 更新分支固定指向官方标签提交：`{commit}`\n\n'
+              '请检查 `wrangler.toml`、资源绑定、迁移和构建要求的变化，并保留本部署的资源 ID、'
+              '自定义域名、关闭 workers.dev/预览地址的配置及主密码政策修改。'
+              'GitHub 会用三方合并保留定制；如有冲突，请先解决。\n\n'
+              '**请使用 Create a merge commit 合并到 production，保留完整上游历史。** '
+              '工作流只创建更新分支和 PR，不修改 production 或 main，不执行上游代码，也不自动合并。'
+              '手动合并后，Cloudflare 才会构建并上线 production。'
+          )
+          own('pulls', method='POST', data={
+              'title': 'chore: update NodeWarden to ' + tag,
+              'head': branch, 'base': base, 'body': body,
+          })
+          print('Created the release update pull request; production and main are unchanged.')

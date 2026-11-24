@@ -4,6 +4,7 @@ main = "src/index.ts"
 compatibility_date = "2024-01-01"
 workers_dev = false
 preview_urls = false
+keep_vars = true
 routes = [ { pattern = "vault.fenghengzhi.com", custom_domain = true } ]
 
 [build]
